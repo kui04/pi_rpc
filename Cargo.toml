@@ -2,5 +2,21 @@
 name = "pi_rpc"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Transport-free Rust wrapper for the pi coding-agent RPC protocol"
+license = "MIT"
 
 [dependencies]
+async-trait = { version = "0.1" }
+memchr = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+thiserror = { version = "2" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+
+[package.metadata.pi_rpc]
+pi_repo = "https://github.com/earendil-works/pi"
+pi_rev = "f1b2e77f5b13b2a199b1052cb79c235451afe7d7"
+pi_protocol_version = 8
