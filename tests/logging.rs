@@ -144,6 +144,7 @@ async fn request_span_carries_tag_and_id() {
     peer.out.send(prompt_response("req_1")).unwrap();
     // Sentinel content must never reach the logs, only tag and id may.
     client.prompt("SENTINEL_qzx7_no_leak").await.unwrap();
+    drop(peer.out);
     let _ = client.close().await;
     assert!(records.has("span:pi_rpc.request rpc.tag=\"prompt\""));
     assert!(records.has("span:record rpc.id=\"req_1\""));
@@ -173,6 +174,7 @@ async fn orphan_response_emits_event() {
     }
     assert!(records.has("event:pi_rpc.dispatch.orphan parent:pi_rpc.reader"));
     assert!(records.has("rpc.id=\"req_999\""));
+    drop(peer.out);
     let _ = client.close().await;
     let _ = peer.inc.recv().await;
 }
@@ -194,6 +196,7 @@ async fn over_cap_line_warns() {
     }
     assert!(records.has("event:pi_rpc.reader.over_cap"));
     assert!(records.has("rpc.cap=16"));
+    drop(peer.out);
     let _ = client.close().await;
 }
 
@@ -207,6 +210,7 @@ async fn request_timeout_warns() {
     assert_eq!(err.kind(), ErrorKind::Timeout);
     assert!(records.has("event:pi_rpc.request.timeout"));
     assert!(records.has("rpc.phase=\"wait\""));
+    drop(_peer.out);
     let _ = client.close().await;
 }
 
@@ -238,6 +242,7 @@ async fn warn_filter_hides_debug_keeps_warn() {
             .any(|line| line.contains("pi_rpc.reader.line")),
         "trace event passed a warn filter"
     );
+    drop(peer.out);
     let _ = client.close().await;
 }
 
@@ -263,6 +268,7 @@ async fn closed_wait_reports_failed_not_timeout() {
         async move { client.wait_for_idle(None).await }
     });
     tokio::task::yield_now().await;
+    drop(_peer.out);
     client.close().await.unwrap();
     let err = waiter.await.unwrap().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Closed);

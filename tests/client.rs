@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use pi_rpc::client::Client;
-use pi_rpc::error::{ErrorKind, Result};
+use pi_rpc::error::{Error, ErrorKind, Result};
 use pi_rpc::event::Event;
 use pi_rpc::extui::{
     ConfirmDialog, EditorDialog, InputDialog, SelectDialog, UiAnswer, UiOutcome, encode_ui_response,
@@ -29,6 +29,7 @@ async fn dropped_clone_keeps_session_alive() {
     assert_eq!(state.session_id, "s1");
     let sent: serde_json::Value = serde_json::from_str(&peer.inc.recv().await.unwrap()).unwrap();
     assert_eq!(sent["id"], "req_1");
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -42,6 +43,7 @@ async fn state_roundtrip_and_sent_shape() {
     let sent: serde_json::Value = serde_json::from_str(&peer.inc.recv().await.unwrap()).unwrap();
     assert_eq!(sent["type"], "get_state");
     assert_eq!(sent["id"], "req_1");
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -69,6 +71,7 @@ async fn out_of_order_responses_match_by_id() {
     peer.out.send(accept(&id_of(&first))).unwrap();
     let (r1, r2) = t.await.unwrap();
     assert!(r1.is_ok() && r2.is_ok());
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -81,6 +84,7 @@ async fn failed_command_maps_to_command_kind() {
         .unwrap();
     let err = client.abort().await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Command);
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -90,6 +94,7 @@ async fn no_response_times_out() {
     let client = Client::with_config(transport, fast_config());
     let err = client.get_state().await.unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Timeout);
+    drop(_peer.out);
     client.close().await.unwrap();
 }
 
@@ -119,6 +124,7 @@ async fn caller_id_is_stamped_over() {
         .unwrap();
     let body = task.await.unwrap().unwrap();
     assert!(matches!(body, pi_rpc::response::Response::Abort));
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -143,6 +149,34 @@ async fn peer_end_closes_pending() {
 }
 
 #[tokio::test]
+async fn close_drains_tail_records_until_transport_end() {
+    let (transport, peer) = pair();
+    let client = Client::with_config(transport, fast_config());
+    let mut events = client.subscribe();
+    let closing = tokio::spawn({
+        let client = client.clone();
+        async move { client.close().await }
+    });
+    // The write half closes first. The peer writes its tail records,
+    // then exits; the client must keep reading until that exit, not
+    // cut the pipe the moment stdin ends.
+    peer.out
+        .send(r#"{"type":"agent_settled","aborted":true}"#.to_string())
+        .unwrap();
+    drop(peer.out);
+    let closed = tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .expect("close must finish")
+        .expect("close must succeed");
+    assert!(closed.is_ok());
+    let late = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("tail record must arrive")
+        .expect("stream must stay open until the drain ends");
+    assert!(matches!(&*late, Event::AgentSettled(_)));
+}
+
+#[tokio::test]
 async fn events_fan_out_to_both_sinks() {
     let (transport, peer) = pair();
     let client = Client::with_config(transport, fast_config());
@@ -164,6 +198,7 @@ async fn events_fan_out_to_both_sinks() {
     assert!(matches!(&*events[1], Event::AgentSettled(_)));
     assert!(matches!(&*rx.recv().await.unwrap(), Event::AgentStart));
     assert_eq!(*seen.lock().unwrap(), 2);
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -179,6 +214,7 @@ async fn handled_prompt_skips_wait() {
         .await
         .unwrap();
     assert!(events.is_empty());
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -209,6 +245,7 @@ async fn prompt_text_folds_deltas() {
         .await
         .unwrap();
     assert_eq!(text, "Hello");
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -256,6 +293,7 @@ async fn dialog_roundtrip_answers_select() {
     assert_eq!(v["value"], "Allow");
     peer.out.send(state_response(&id)).unwrap();
     task.await.unwrap().unwrap();
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -283,6 +321,7 @@ async fn missing_handler_auto_dismisses() {
     assert_eq!(v["cancelled"], true);
     peer.out.send(state_response(&id)).unwrap();
     task.await.unwrap().unwrap();
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -338,6 +377,54 @@ async fn wedged_close_times_out() {
     assert_eq!(err.kind(), ErrorKind::Timeout);
 }
 
+struct FaultTx;
+struct FaultRx;
+
+impl pi_rpc::transport::TransportSend for FaultTx {
+    async fn send(&mut self, _line: String) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl pi_rpc::transport::TransportRecv for FaultRx {
+    async fn recv(&mut self) -> Result<Option<String>> {
+        Err(Error::new(ErrorKind::Transport, "pipe reset"))
+    }
+}
+
+struct Fault;
+
+impl Transport for Fault {
+    type Tx = FaultTx;
+    type Rx = FaultRx;
+
+    fn split(self) -> (FaultTx, FaultRx) {
+        (FaultTx, FaultRx)
+    }
+}
+
+#[tokio::test]
+async fn close_surfaces_read_fault() {
+    let client = Client::with_config(Fault, fast_config());
+    let err = client.close().await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Transport);
+}
+
+#[tokio::test]
+async fn close_drain_honors_close_timeout() {
+    let (transport, _peer) = pair();
+    let config = fast_config().with_close_timeout(Duration::from_millis(30));
+    let client = Client::with_config(transport, config);
+    // The peer never ends its read side, so the drain hits its own
+    // budget instead of the request timeout.
+    let err = client.close().await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Timeout);
+}
+
 #[tokio::test]
 async fn panicking_listener_counts_without_killing_loop() {
     let (transport, peer) = pair();
@@ -363,6 +450,7 @@ async fn panicking_listener_counts_without_killing_loop() {
     assert_eq!(client.drop_counts().callback_panic, 2);
     let state = client.get_state().await;
     assert!(state.is_err());
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -382,6 +470,7 @@ async fn lagged_reader_reports_protocol() {
         Ok(Ok(_)) => panic!("expected lag"),
         Err(_) => panic!("expected lag, got timeout"),
     }
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -408,6 +497,7 @@ async fn long_line_skips_without_killing_stream() {
     let state = task.await.unwrap().unwrap();
     assert_eq!(state.session_id, "s1");
     assert_eq!(client.drop_counts().malformed, 1);
+    drop(peer.out);
     client.close().await.unwrap();
 }
 
@@ -442,5 +532,6 @@ async fn drops_are_counted() {
     assert_eq!(counts.stray_response, 2);
     assert_eq!(counts.bad_event, 1);
     assert_eq!(counts.bad_ui, 1);
+    drop(peer.out);
     client.close().await.unwrap();
 }

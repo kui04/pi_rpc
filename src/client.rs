@@ -52,6 +52,9 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Config {
     /// Deadline for one request/response round trip.
     pub request_timeout: Duration,
+    /// Deadline for the whole close: write-half handshake plus the
+    /// read-side drain. `None` follows the request timeout.
+    pub close_timeout: Option<Duration>,
     /// Deadline for run waits.
     pub wait_timeout: Duration,
     /// Broadcast channel depth for session events.
@@ -65,6 +68,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            close_timeout: None,
             wait_timeout: Duration::from_secs(60),
             event_capacity: 1024,
             max_line: DEFAULT_MAX_LINE,
@@ -76,6 +80,13 @@ impl Config {
     /// Set the request round-trip deadline.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the close deadline. `None` (the default) follows the
+    /// request timeout.
+    pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = Some(timeout);
         self
     }
 
@@ -168,7 +179,11 @@ struct Inner {
     closed: AtomicBool,
     shutdown: watch::Sender<bool>,
     config: Config,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    /// Terminal read fault, if any: set when the transport ends in
+    /// an error. Clean EOF leaves it empty. `close` surfaces it.
+    fault: Mutex<Option<Error>>,
 }
 
 /// Typed client for one pi session. All methods take `&self`.
@@ -235,7 +250,9 @@ impl Client {
             closed: AtomicBool::new(false),
             shutdown: watch::Sender::new(false),
             config,
-            tasks: Mutex::new(Vec::new()),
+            writer: Mutex::new(None),
+            reader: Mutex::new(None),
+            fault: Mutex::new(None),
         });
         let (tx_half, rx_half) = transport.split();
         // Spans attach to the task futures, never held as guards: a guard
@@ -244,7 +261,8 @@ impl Client {
         let writer_span = span!(Level::DEBUG, "pi_rpc.writer");
         let reader = tokio::spawn(read_lines(rx_half, inner.clone()).instrument(reader_span));
         let looper = tokio::spawn(run_loop(tx_half, rx, inner.clone()).instrument(writer_span));
-        inner.tasks.lock().unwrap().extend([reader, looper]);
+        *inner.writer.lock().unwrap() = Some(looper);
+        *inner.reader.lock().unwrap() = Some(reader);
         Self { inner }
     }
 
@@ -862,23 +880,74 @@ impl Client {
     /// Prefer this over dropping: `Drop` aborts the loop without the
     /// close handshake, so the peer sees a cut stream.
     ///
-    /// The drain waits up to the request timeout. Past it, the loop is
-    /// aborted, pending work fails, and `close` reports `Timeout`.
-    /// A second call returns `Ok` at once, even if the first one failed.
+    /// Closing stdin makes the peer wind down: it writes its tail
+    /// records, then the transport ends. `close` keeps reading until
+    /// that end, so the records drain and the peer never writes into
+    /// a cut pipe (EPIPE). The whole wait shares one budget, the
+    /// configured `close_timeout` or the request timeout when unset;
+    /// past it, both loops abort and `close` reports `Timeout`. A
+    /// read-side fault that ends the drain fails the close with the
+    /// transport error; clean EOF reports `Ok`. A second call returns
+    /// `Ok` at once, even if the first one failed.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            // Already closed. Surface a fault that ended the session
+            // before this call, if one is recorded.
+            return match self.inner.fault.lock().unwrap().take() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            };
         }
         self.inner.shutdown.send_replace(true);
         let (done_tx, done_rx) = oneshot::channel();
         if self.inner.tx.send(TxJob::Close { done: done_tx }).is_err() {
-            self.fail_all(Error::new(ErrorKind::Closed, "read loop gone"));
+            teardown(
+                &self.inner,
+                &Error::new(ErrorKind::Closed, "writer loop gone"),
+            );
             return Ok(());
         }
-        let drained = tokio::time::timeout(self.inner.config.request_timeout, done_rx).await;
-        let result = match drained {
-            Ok(result) => result.unwrap_or(Err(Error::new(ErrorKind::Closed, "read loop gone"))),
+        // One deadline covers both legs: the handshake, then the
+        // drain. The configured close budget, or the request timeout.
+        let deadline = Instant::now()
+            + self
+                .inner
+                .config
+                .close_timeout
+                .unwrap_or(self.inner.config.request_timeout);
+        let result = match tokio::time::timeout_at(deadline, done_rx).await {
+            Ok(result) => result.unwrap_or(Err(Error::new(ErrorKind::Closed, "writer loop gone"))),
             Err(_) => Err(Error::new(ErrorKind::Timeout, "close stalled")),
+        };
+        // The write half is closed. Await the reader, which only
+        // ends at transport end, so the peer's tail records drain
+        // before the pipe is cut.
+        let result = match result {
+            Err(err) => Err(err),
+            Ok(()) => {
+                // Only close takes the handle; drop cannot run while
+                // close holds the client. The None arm is unreachable,
+                // kept only to keep the match total.
+                let mut reader = self.inner.reader.lock().unwrap().take();
+                let finished = match &mut reader {
+                    Some(handle) => tokio::time::timeout_at(deadline, handle).await,
+                    None => Ok(Ok(())),
+                };
+                match finished {
+                    Err(_) => {
+                        if let Some(handle) = reader.as_ref() {
+                            handle.abort();
+                        }
+                        Err(Error::new(ErrorKind::Timeout, "close stalled"))
+                    }
+                    Ok(_) => match self.inner.fault.lock().unwrap().take() {
+                        // A transport fault that ended the read side
+                        // fails the close; clean EOF reports Ok.
+                        Some(err) => Err(err),
+                        None => Ok(()),
+                    },
+                }
+            }
         };
         match &result {
             Ok(()) => event!(
@@ -893,12 +962,9 @@ impl Client {
                 "client close failed ({{error.type}})",
             ),
         }
-        self.fail_all(Error::new(ErrorKind::Closed, "client closed"));
-        if let Ok(mut tasks) = self.inner.tasks.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
-            }
-        }
+        // Fail pending work and stop both loops. Every close path
+        // ends here, so no task outlives a failed close.
+        teardown(&self.inner, &Error::new(ErrorKind::Closed, "client closed"));
         result
     }
 
@@ -970,7 +1036,7 @@ impl Client {
                 rpc.phase = "queue",
                 "send queue for {{rpc.tag}} {{rpc.id}} is gone ({{rpc.phase}})",
             );
-            return Err(Error::new(ErrorKind::Closed, "read loop gone"));
+            return Err(Error::new(ErrorKind::Closed, "writer loop gone"));
         }
         // Sent means queued for the writer, not yet on the wire. A later
         // send stall still reports Timeout against this id.
@@ -1004,7 +1070,7 @@ impl Client {
                     rpc.phase = "send",
                     "send leg for {{rpc.tag}} {{rpc.id}} ended ({{rpc.phase}})",
                 );
-                Err(Error::new(ErrorKind::Closed, "read loop gone"))
+                Err(Error::new(ErrorKind::Closed, "writer loop gone"))
             }
             Ok(Ok(Err(err))) => {
                 self.inner.pending.lock().unwrap().remove(&id);
@@ -1077,10 +1143,6 @@ impl Client {
             }
         }
     }
-
-    fn fail_all(&self, err: Error) {
-        fail_shared(&self.inner, &err);
-    }
 }
 
 impl Drop for Client {
@@ -1094,12 +1156,10 @@ impl Drop for Client {
             Level::DEBUG,
             "last client handle dropped",
         );
-        self.fail_all(Error::new(ErrorKind::Closed, "client dropped"));
-        if let Ok(mut tasks) = self.inner.tasks.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
-            }
-        }
+        teardown(
+            &self.inner,
+            &Error::new(ErrorKind::Closed, "client dropped"),
+        );
     }
 }
 
@@ -1205,6 +1265,7 @@ async fn read_lines<Rx: TransportRecv>(mut rx: Rx, inner: Arc<Inner>) {
                     error.type = ?err.kind(),
                     "reader failed ({{error.type}})",
                 );
+                *inner.fault.lock().unwrap() = Some(err.clone());
                 fail_shared(&inner, &err);
                 break;
             }
@@ -1294,7 +1355,7 @@ impl Drop for LoopEnd {
     }
 }
 
-fn fail_shared(inner: &Arc<Inner>, err: &Error) {
+fn fail_shared(inner: &Inner, err: &Error) {
     let senders: Vec<oneshot::Sender<Result<Response>>> = inner
         .pending
         .lock()
@@ -1304,6 +1365,19 @@ fn fail_shared(inner: &Arc<Inner>, err: &Error) {
         .collect();
     for tx in senders {
         let _ = tx.send(Err(err.clone()));
+    }
+}
+
+/// Fail pending work and stop both loops. One home for the
+/// teardown so no path can forget a task: close and drop call it,
+/// and the reader handle is not reusable after it runs.
+fn teardown(inner: &Inner, err: &Error) {
+    fail_shared(inner, err);
+    if let Some(handle) = inner.writer.lock().unwrap().take() {
+        handle.abort();
+    }
+    if let Some(handle) = inner.reader.lock().unwrap().take() {
+        handle.abort();
     }
 }
 
