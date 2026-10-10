@@ -10,6 +10,7 @@
 //! emitting it (`jsonl.ts:43-49`). Both fail loudly over parsing halves.
 
 use serde::Serialize;
+use tracing::{Level, event};
 
 use crate::error::{Error, ErrorKind};
 
@@ -78,6 +79,13 @@ impl Decoder {
                 raw = &raw[..raw.len() - 1];
             }
             if raw.len() > self.max_line {
+                event!(
+                    name: "pi_rpc.frame.over_cap",
+                    Level::WARN,
+                    rpc.bytes = raw.len(),
+                    rpc.cap = self.max_line,
+                    "line of {{rpc.bytes}} bytes exceeds cap of {{rpc.cap}}",
+                );
                 return Err(Error::new(
                     ErrorKind::Protocol,
                     format!(
@@ -107,6 +115,13 @@ impl Decoder {
             }
         }
         if self.buf.len() - self.head > self.max_line {
+            event!(
+                name: "pi_rpc.frame.over_cap",
+                Level::WARN,
+                rpc.bytes = self.buf.len() - self.head,
+                rpc.cap = self.max_line,
+                "buffered {{rpc.bytes}} bytes past cap of {{rpc.cap}} without LF",
+            );
             return Err(Error::new(
                 ErrorKind::Protocol,
                 format!(

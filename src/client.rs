@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tracing::{Instrument, Level, event, span};
 
 use crate::command::{
     Bash, Command, Common, Compact, ExportHtml, FollowUp, Fork, GetEntries, NewSession, Prompt,
@@ -237,8 +238,12 @@ impl Client {
             tasks: Mutex::new(Vec::new()),
         });
         let (tx_half, rx_half) = transport.split();
-        let reader = tokio::spawn(read_lines(rx_half, inner.clone()));
-        let looper = tokio::spawn(run_loop(tx_half, rx, inner.clone()));
+        // Spans attach to the task futures, never held as guards: a guard
+        // across an await would leak the span into sibling tasks.
+        let reader_span = span!(Level::DEBUG, "pi_rpc.reader");
+        let writer_span = span!(Level::DEBUG, "pi_rpc.writer");
+        let reader = tokio::spawn(read_lines(rx_half, inner.clone()).instrument(reader_span));
+        let looper = tokio::spawn(run_loop(tx_half, rx, inner.clone()).instrument(writer_span));
         inner.tasks.lock().unwrap().extend([reader, looper]);
         Self { inner }
     }
@@ -769,16 +774,13 @@ impl Client {
     /// Sees only events that arrive after this call subscribes. A settle
     /// that already fired is missed, like upstream `waitForIdle`.
     pub async fn wait_for_idle(&self, timeout: Option<Duration>) -> Result<()> {
+        let span = span!(Level::DEBUG, "pi_rpc.wait", rpc.op = "wait_for_idle");
+        let started = Instant::now();
         let deadline = Instant::now() + timeout.unwrap_or(self.inner.config.wait_timeout);
         let mut rx = self.subscribe();
-        loop {
-            if matches!(
-                &*recv_before(&mut rx, deadline).await?,
-                Event::AgentSettled(_)
-            ) {
-                return Ok(());
-            }
-        }
+        wait_idle_inner(started, deadline, &mut rx)
+            .instrument(span)
+            .await
     }
 
     /// Gather events until `agent_settled`. `None` means the 60s wait default.
@@ -787,17 +789,13 @@ impl Client {
     /// `prompt_and_wait` to cover a full run from its first event.
     /// Events arrive shared (`Arc`): clone the `Arc`, not the payload.
     pub async fn collect_events(&self, timeout: Option<Duration>) -> Result<Vec<Arc<Event>>> {
+        let span = span!(Level::DEBUG, "pi_rpc.wait", rpc.op = "collect_events");
+        let started = Instant::now();
         let deadline = Instant::now() + timeout.unwrap_or(self.inner.config.wait_timeout);
         let mut rx = self.subscribe();
-        let mut out = Vec::new();
-        loop {
-            let event = recv_before(&mut rx, deadline).await?;
-            let settled = matches!(&*event, Event::AgentSettled(_));
-            out.push(event);
-            if settled {
-                return Ok(out);
-            }
-        }
+        wait_drain("collect_events", started, deadline, &mut rx)
+            .instrument(span)
+            .await
     }
 
     /// Prompt, then gather events until `agent_settled`.
@@ -826,20 +824,19 @@ impl Client {
         req: PromptReq,
         timeout: Option<Duration>,
     ) -> Result<Vec<Arc<Event>>> {
+        let span = span!(Level::DEBUG, "pi_rpc.wait", rpc.op = "prompt_and_wait");
+        let started = Instant::now();
         let deadline = Instant::now() + timeout.unwrap_or(self.inner.config.wait_timeout);
         let mut rx = self.subscribe();
         match self.prompt_with(req).await? {
-            PromptDisposition::Handled => Ok(Vec::new()),
+            PromptDisposition::Handled => {
+                span.in_scope(|| wait_settled("prompt_and_wait", started, 0));
+                Ok(Vec::new())
+            }
             _ => {
-                let mut out = Vec::new();
-                loop {
-                    let event = recv_before(&mut rx, deadline).await?;
-                    let settled = matches!(&*event, Event::AgentSettled(_));
-                    out.push(event);
-                    if settled {
-                        return Ok(out);
-                    }
-                }
+                wait_drain("prompt_and_wait", started, deadline, &mut rx)
+                    .instrument(span)
+                    .await
             }
         }
     }
@@ -883,6 +880,19 @@ impl Client {
             Ok(result) => result.unwrap_or(Err(Error::new(ErrorKind::Closed, "read loop gone"))),
             Err(_) => Err(Error::new(ErrorKind::Timeout, "close stalled")),
         };
+        match &result {
+            Ok(()) => event!(
+                name: "pi_rpc.client.closed",
+                Level::DEBUG,
+                "client closed",
+            ),
+            Err(err) => event!(
+                name: "pi_rpc.client.close_failed",
+                Level::WARN,
+                error.type = ?err.kind(),
+                "client close failed ({{error.type}})",
+            ),
+        }
         self.fail_all(Error::new(ErrorKind::Closed, "client closed"));
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.drain(..) {
@@ -893,21 +903,52 @@ impl Client {
     }
 
     async fn send_cmd(&self, cmd: Command) -> Result<Response> {
+        let tag = cmd.tag();
+        // One span per request, attached to the inner future: the span
+        // enters on every poll and exits on every yield, so a sibling task
+        // never inherits it across an await. The id records after stamping;
+        // content never enters fields, only tag, id, and byte length.
+        let span = span!(
+            Level::DEBUG,
+            "pi_rpc.request",
+            rpc.tag = tag,
+            rpc.id = tracing::field::Empty,
+        );
+        let started = Instant::now();
+        self.send_cmd_inner(cmd, tag, started, span.clone())
+            .instrument(span)
+            .await
+    }
+
+    async fn send_cmd_inner(
+        &self,
+        cmd: Command,
+        tag: &str,
+        started: Instant,
+        span: tracing::Span,
+    ) -> Result<Response> {
         if self.inner.closed.load(Ordering::SeqCst) {
+            event!(
+                name: "pi_rpc.request.rejected",
+                Level::ERROR,
+                rpc.tag = tag,
+                "rejected {{rpc.tag}} on a closed client",
+            );
             return Err(Error::new(ErrorKind::Closed, "transport closed"));
         }
         // One deadline covers the send leg and the response wait, like the
         // single upstream timer. Worst case stays one timeout, not two.
         let deadline = Instant::now() + self.inner.config.request_timeout;
-        let tag = cmd.tag();
         let mut value = serde_json::to_value(&cmd)
             .map_err(|err| Error::new(ErrorKind::Protocol, format!("bad command: {err}")))?;
         // Always stamp a fresh id like upstream (`rpc-client.ts:577-578`).
         // A caller id would collide with the counter and cross requests.
         let id = format!("req_{}", self.inner.next_id.fetch_add(1, Ordering::SeqCst));
+        span.record("rpc.id", id.as_str());
         value["id"] = id.clone().into();
         let line = serde_json::to_string(&value)
             .map_err(|err| Error::new(ErrorKind::Protocol, format!("bad command: {err}")))?;
+        let bytes = line.len();
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().unwrap().insert(id.clone(), tx);
         let (done_tx, done_rx) = oneshot::channel();
@@ -921,14 +962,33 @@ impl Client {
             .is_err()
         {
             self.inner.pending.lock().unwrap().remove(&id);
+            event!(
+                name: "pi_rpc.request.aborted",
+                Level::ERROR,
+                rpc.tag = tag,
+                rpc.id = id.as_str(),
+                rpc.phase = "queue",
+                "send queue for {{rpc.tag}} {{rpc.id}} is gone ({{rpc.phase}})",
+            );
             return Err(Error::new(ErrorKind::Closed, "read loop gone"));
         }
+        // Sent means queued for the writer, not yet on the wire. A later
+        // send stall still reports Timeout against this id.
+        event!(
+            name: "pi_rpc.request.sent",
+            Level::DEBUG,
+            rpc.tag = tag,
+            rpc.id = id.as_str(),
+            rpc.bytes = bytes,
+            "sent {{rpc.tag}} {{rpc.id}} ({{rpc.bytes}} bytes)",
+        );
         // The send leg shares the deadline: a wedged transport surfaces
         // as Timeout, never hangs the caller.
         let send_done = tokio::time::timeout_at(deadline, done_rx).await;
         match send_done {
             Err(_) => {
                 self.inner.pending.lock().unwrap().remove(&id);
+                request_timeout(&id, tag, started, "send");
                 Err(Error::new(
                     ErrorKind::Timeout,
                     format!("send stalled for {tag} ({id})"),
@@ -936,10 +996,27 @@ impl Client {
             }
             Ok(Err(_)) => {
                 self.inner.pending.lock().unwrap().remove(&id);
+                event!(
+                    name: "pi_rpc.request.aborted",
+                    Level::ERROR,
+                    rpc.tag = tag,
+                    rpc.id = id.as_str(),
+                    rpc.phase = "send",
+                    "send leg for {{rpc.tag}} {{rpc.id}} ended ({{rpc.phase}})",
+                );
                 Err(Error::new(ErrorKind::Closed, "read loop gone"))
             }
             Ok(Ok(Err(err))) => {
                 self.inner.pending.lock().unwrap().remove(&id);
+                event!(
+                    name: "pi_rpc.request.aborted",
+                    Level::ERROR,
+                    rpc.tag = tag,
+                    rpc.id = id.as_str(),
+                    rpc.phase = "send",
+                    error.type = ?err.kind(),
+                    "send leg for {{rpc.tag}} {{rpc.id}} failed ({{error.type}})",
+                );
                 Err(err)
             }
             Ok(Ok(Ok(()))) => Ok(()),
@@ -948,16 +1025,56 @@ impl Client {
             Err(_) => {
                 self.inner.pending.lock().unwrap().remove(&id);
                 if self.inner.closed.load(Ordering::SeqCst) {
+                    event!(
+                        name: "pi_rpc.request.aborted",
+                        Level::ERROR,
+                        rpc.tag = tag,
+                        rpc.id = id.as_str(),
+                        rpc.phase = "wait",
+                        "read loop for {{rpc.tag}} {{rpc.id}} ended ({{rpc.phase}})",
+                    );
                     Err(Error::new(ErrorKind::Closed, "read loop ended"))
                 } else {
+                    request_timeout(&id, tag, started, "wait");
                     Err(Error::new(
                         ErrorKind::Timeout,
                         format!("no response for {tag} ({id})"),
                     ))
                 }
             }
-            Ok(Err(_)) => Err(Error::new(ErrorKind::Closed, "read loop ended")),
-            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                event!(
+                    name: "pi_rpc.request.aborted",
+                    Level::ERROR,
+                    rpc.tag = tag,
+                    rpc.id = id.as_str(),
+                    rpc.phase = "wait",
+                    "read loop for {{rpc.tag}} {{rpc.id}} ended ({{rpc.phase}})",
+                );
+                Err(Error::new(ErrorKind::Closed, "read loop ended"))
+            }
+            Ok(Ok(response)) => {
+                match &response {
+                    Ok(body) => event!(
+                        name: "pi_rpc.request.done",
+                        Level::DEBUG,
+                        rpc.tag = tag,
+                        rpc.id = id.as_str(),
+                        rpc.kind = body.tag(),
+                        rpc.elapsed_ms = started.elapsed().as_millis() as u64,
+                        "{{rpc.tag}} {{rpc.id}} answered {{rpc.kind}} in {{rpc.elapsed_ms}}ms",
+                    ),
+                    Err(err) => event!(
+                        name: "pi_rpc.request.failed",
+                        Level::DEBUG,
+                        rpc.tag = tag,
+                        rpc.id = id.as_str(),
+                        error.type = ?err.kind(),
+                        "{{rpc.tag}} {{rpc.id}} failed ({{error.type}})",
+                    ),
+                }
+                response
+            }
         }
     }
 
@@ -972,6 +1089,11 @@ impl Drop for Client {
         if self.inner.handles.fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
         }
+        event!(
+            name: "pi_rpc.client.dropped",
+            Level::DEBUG,
+            "last client handle dropped",
+        );
         self.fail_all(Error::new(ErrorKind::Closed, "client dropped"));
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.drain(..) {
@@ -1010,10 +1132,13 @@ impl EventStream {
         match self.rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(broadcast::error::TryRecvError::Empty) => Ok(None),
-            Err(broadcast::error::TryRecvError::Lagged(skipped)) => Err(Error::new(
-                ErrorKind::Protocol,
-                format!("event receiver lagged by {skipped}"),
-            )),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                stream_lagged(skipped);
+                Err(Error::new(
+                    ErrorKind::Protocol,
+                    format!("event receiver lagged by {skipped}"),
+                ))
+            }
             Err(broadcast::error::TryRecvError::Closed) => {
                 Err(Error::new(ErrorKind::Closed, "event stream closed"))
             }
@@ -1021,12 +1146,25 @@ impl EventStream {
     }
 }
 
+/// One home for the lag event so the two stream paths cannot drift apart.
+fn stream_lagged(skipped: u64) {
+    event!(
+        name: "pi_rpc.stream.lagged",
+        Level::WARN,
+        rpc.skipped = skipped,
+        "stream lagged by {{rpc.skipped}} events",
+    );
+}
+
 fn map_broadcast(err: broadcast::error::RecvError) -> Error {
     match err {
-        broadcast::error::RecvError::Lagged(skipped) => Error::new(
-            ErrorKind::Protocol,
-            format!("event receiver lagged by {skipped}"),
-        ),
+        broadcast::error::RecvError::Lagged(skipped) => {
+            stream_lagged(skipped);
+            Error::new(
+                ErrorKind::Protocol,
+                format!("event receiver lagged by {skipped}"),
+            )
+        }
         broadcast::error::RecvError::Closed => Error::new(ErrorKind::Closed, "event stream closed"),
     }
 }
@@ -1057,14 +1195,27 @@ impl Drop for Subscription {
 /// send never stalls reads and no `recv` is ever cancelled mid-frame.
 async fn read_lines<Rx: TransportRecv>(mut rx: Rx, inner: Arc<Inner>) {
     // The guard covers every exit path including panic unwind.
-    let _guard = LoopEnd(inner.clone());
+    let _end = LoopEnd(inner.clone());
     loop {
         match rx.recv().await {
             Err(err) => {
+                event!(
+                    name: "pi_rpc.reader.failed",
+                    Level::ERROR,
+                    error.type = ?err.kind(),
+                    "reader failed ({{error.type}})",
+                );
                 fail_shared(&inner, &err);
                 break;
             }
             Ok(None) => {
+                // Clean end, not a fault: the transport documents `None`
+                // as orderly close. WARN keeps it visible without paging.
+                event!(
+                    name: "pi_rpc.reader.ended",
+                    Level::WARN,
+                    "transport ended",
+                );
                 fail_shared(&inner, &Error::new(ErrorKind::Closed, "transport ended"));
                 break;
             }
@@ -1073,9 +1224,23 @@ async fn read_lines<Rx: TransportRecv>(mut rx: Rx, inner: Arc<Inner>) {
                 // already in hand, so dropping it keeps framing synced
                 // without killing the stream.
                 if line.len() > inner.config.max_line {
+                    let cap = inner.config.max_line;
                     bump(&inner, |c| c.malformed += 1);
+                    event!(
+                        name: "pi_rpc.reader.over_cap",
+                        Level::WARN,
+                        rpc.bytes = line.len(),
+                        rpc.cap = cap,
+                        "line of {{rpc.bytes}} bytes exceeds cap of {{rpc.cap}}",
+                    );
                     continue;
                 }
+                event!(
+                    name: "pi_rpc.reader.line",
+                    Level::TRACE,
+                    rpc.bytes = line.len(),
+                    "read {{rpc.bytes}} bytes",
+                );
                 dispatch(&inner, &line).await;
             }
         }
@@ -1090,13 +1255,18 @@ async fn run_loop<Tx: TransportSend>(
     // Every exit path fails pending work and marks closed, including a
     // panic unwind past this frame. Normal breaks already drained the map,
     // so the guard is a no-op for them.
-    let _guard = LoopEnd(inner.clone());
+    let _end = LoopEnd(inner.clone());
     while let Some(job) = jobs.recv().await {
         match job {
             TxJob::Send { line, done } => {
                 let _ = done.send(tx.send(line).await);
             }
             TxJob::Close { done } => {
+                event!(
+                    name: "pi_rpc.writer.close",
+                    Level::DEBUG,
+                    "writer closing",
+                );
                 let _ = done.send(tx.close().await);
                 break;
             }
@@ -1142,6 +1312,12 @@ async fn dispatch(inner: &Arc<Inner>, line: &str) {
         Ok(value) => value,
         Err(_) => {
             bump(inner, |c| c.malformed += 1);
+            event!(
+                name: "pi_rpc.dispatch.malformed",
+                Level::DEBUG,
+                rpc.bytes = line.len(),
+                "dropped {{rpc.bytes}} unparsable bytes",
+            );
             return;
         }
     };
@@ -1149,7 +1325,15 @@ async fn dispatch(inner: &Arc<Inner>, line: &str) {
         Some("response") => dispatch_response_value(inner, value),
         Some("extension_ui_request") => dispatch_ui_value(inner, value).await,
         Some(_) => dispatch_event_value(inner, value),
-        None => bump(inner, |c| c.malformed += 1),
+        None => {
+            bump(inner, |c| c.malformed += 1);
+            event!(
+                name: "pi_rpc.dispatch.malformed",
+                Level::DEBUG,
+                rpc.bytes = line.len(),
+                "dropped typeless record of {{rpc.bytes}} bytes",
+            );
+        }
     }
 }
 
@@ -1162,21 +1346,55 @@ fn dispatch_response_value(inner: &Arc<Inner>, value: serde_json::Value) {
             // Only id-less or foreign lines count as malformed drift.
             if let Some(id) = id_hint {
                 if let Some(sender) = inner.pending.lock().unwrap().remove(&id) {
+                    event!(
+                        name: "pi_rpc.dispatch.response_error",
+                        Level::DEBUG,
+                        rpc.id = id.as_str(),
+                        error.type = ?err.kind(),
+                        "response {{rpc.id}} failed decode ({{error.type}})",
+                    );
                     let _ = sender.send(Err(err));
                     return;
                 }
             }
             bump(inner, |c| c.malformed += 1);
+            event!(
+                name: "pi_rpc.dispatch.malformed",
+                Level::DEBUG,
+                "dropped id-less broken response",
+            );
             return;
         }
     };
     let Some(id) = envelope.id.clone() else {
         bump(inner, |c| c.stray_response += 1);
+        event!(
+            name: "pi_rpc.dispatch.orphan",
+            Level::DEBUG,
+            rpc.kind = envelope.body.tag(),
+            "orphan {{rpc.kind}} response with no id",
+        );
         return;
     };
+    let tag = envelope.body.tag();
     let sender = inner.pending.lock().unwrap().remove(&id);
     if sender.is_none() {
         bump(inner, |c| c.stray_response += 1);
+        event!(
+            name: "pi_rpc.dispatch.orphan",
+            Level::DEBUG,
+            rpc.id = id.as_str(),
+            rpc.kind = tag,
+            "orphan {{rpc.kind}} response {{rpc.id}}",
+        );
+    } else {
+        event!(
+            name: "pi_rpc.dispatch.response",
+            Level::DEBUG,
+            rpc.id = id.as_str(),
+            rpc.kind = tag,
+            "matched {{rpc.kind}} response {{rpc.id}}",
+        );
     }
     if let Some(sender) = sender {
         let _ = sender.send(Ok(envelope.body));
@@ -1188,6 +1406,11 @@ async fn dispatch_ui_value(inner: &Arc<Inner>, value: serde_json::Value) {
         Some(id) => id.to_string(),
         None => {
             bump(inner, |c| c.bad_ui += 1);
+            event!(
+                name: "pi_rpc.dispatch.bad_ui",
+                Level::DEBUG,
+                "dropped id-less dialog request",
+            );
             return;
         }
     };
@@ -1195,35 +1418,94 @@ async fn dispatch_ui_value(inner: &Arc<Inner>, value: serde_json::Value) {
         Ok(request) => request,
         Err(_) => {
             bump(inner, |c| c.bad_ui += 1);
+            event!(
+                name: "pi_rpc.dispatch.bad_ui",
+                Level::DEBUG,
+                rpc.id = id.as_str(),
+                "dropped broken dialog request {{rpc.id}}",
+            );
             return;
         }
     };
+    event!(
+        name: "pi_rpc.ui.shown",
+        Level::DEBUG,
+        rpc.id = id.as_str(),
+        rpc.dialog = request.tag(),
+        "dialog {{rpc.dialog}} {{rpc.id}} shown",
+    );
     // The handler runs spawned: dialogs never stall the reader, so the
     // stream keeps flowing and reentrant client calls resolve. The answer
     // carries the request id, routing it back to its dialog.
     let worker = inner.clone();
-    tokio::spawn(async move {
-        // The handler answers under the wait timeout, like pi-side timeouts.
-        // Expiry auto-dismisses.
-        let answer = match tokio::time::timeout(
-            worker.config.wait_timeout,
-            answer_dialog(&worker, &request),
-        )
-        .await
-        {
-            Ok(answer) => answer,
-            Err(_) => Some(UiAnswer::Cancelled),
-        };
-        if let Some(answer) = answer {
-            if let Ok(line) = encode_ui_response(&id, &answer) {
+    // The dialog keeps the reader span: without this the spawned task
+    // polls with no parent and its events detach from the stream.
+    let dialog_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
+            // The handler answers under the wait timeout, like pi-side timeouts.
+            // Expiry auto-dismisses.
+            let answer = match tokio::time::timeout(
+                worker.config.wait_timeout,
+                answer_dialog(&worker, &request),
+            )
+            .await
+            {
+                Ok(answer) => answer,
+                Err(_) => {
+                    event!(
+                        name: "pi_rpc.ui.timeout",
+                        Level::WARN,
+                        rpc.id = id.as_str(),
+                        rpc.dialog = request.tag(),
+                        "dialog {{rpc.dialog}} {{rpc.id}} auto-dismissed",
+                    );
+                    Some(UiAnswer::Cancelled)
+                }
+            };
+            if let Some(answer) = answer {
+                let line = match encode_ui_response(&id, &answer) {
+                    Ok(line) => line,
+                    Err(_) => {
+                        event!(
+                            name: "pi_rpc.ui.answer_dropped",
+                            Level::WARN,
+                            rpc.id = id.as_str(),
+                            rpc.dialog = request.tag(),
+                            "answer for {{rpc.dialog}} {{rpc.id}} failed encode",
+                        );
+                        return;
+                    }
+                };
                 let (done_tx, _) = oneshot::channel();
-                let _ = worker.tx.send(TxJob::Send {
-                    line,
-                    done: done_tx,
-                });
+                if worker
+                    .tx
+                    .send(TxJob::Send {
+                        line,
+                        done: done_tx,
+                    })
+                    .is_ok()
+                {
+                    event!(
+                        name: "pi_rpc.ui.answered",
+                        Level::DEBUG,
+                        rpc.id = id.as_str(),
+                        rpc.dialog = request.tag(),
+                        "dialog {{rpc.dialog}} {{rpc.id}} answered",
+                    );
+                } else {
+                    event!(
+                        name: "pi_rpc.ui.answer_dropped",
+                        Level::WARN,
+                        rpc.id = id.as_str(),
+                        rpc.dialog = request.tag(),
+                        "answer for {{rpc.dialog}} {{rpc.id}} missed the writer",
+                    );
+                }
             }
         }
-    });
+        .instrument(dialog_span),
+    );
 }
 
 async fn answer_dialog(inner: &Arc<Inner>, request: &UiRequest) -> Option<UiAnswer> {
@@ -1276,9 +1558,15 @@ fn dispatch_event_value(inner: &Arc<Inner>, value: serde_json::Value) {
         Ok(event) => std::sync::Arc::new(event),
         Err(_) => {
             bump(inner, |c| c.bad_event += 1);
+            event!(
+                name: "pi_rpc.dispatch.bad_event",
+                Level::DEBUG,
+                "dropped broken event",
+            );
             return;
         }
     };
+    let tag = event.tag();
     let has_broadcast = inner.events.receiver_count() > 0;
     let callbacks: Vec<Callback> = inner
         .callbacks
@@ -1290,6 +1578,13 @@ fn dispatch_event_value(inner: &Arc<Inner>, value: serde_json::Value) {
     if !has_broadcast && callbacks.is_empty() {
         return;
     }
+    event!(
+        name: "pi_rpc.dispatch.event",
+        Level::DEBUG,
+        rpc.kind = tag,
+        rpc.receivers = has_broadcast as usize + callbacks.len(),
+        "fanned out {{rpc.kind}} to {{rpc.receivers}} receivers",
+    );
     // Callbacks run before broadcast sends, so a test that waits for a
     // later event observes every earlier callback effect deterministically.
     for callback in callbacks {
@@ -1300,6 +1595,12 @@ fn dispatch_event_value(inner: &Arc<Inner>, value: serde_json::Value) {
         }));
         if caught.is_err() {
             bump(inner, |c| c.callback_panic += 1);
+            event!(
+                name: "pi_rpc.dispatch.callback_panic",
+                Level::WARN,
+                rpc.kind = tag,
+                "listener for {{rpc.kind}} panicked",
+            );
         }
     }
     if has_broadcast {
@@ -1314,6 +1615,85 @@ async fn recv_before(stream: &mut EventStream, deadline: Instant) -> Result<Arc<
     }
 }
 
+/// Drain events until `agent_settled`, reporting settle and timeout under
+/// the caller's span. Shared by all wait helpers.
+async fn wait_drain(
+    op: &'static str,
+    started: Instant,
+    deadline: Instant,
+    rx: &mut EventStream,
+) -> Result<Vec<Arc<Event>>> {
+    match drain_until_settled(rx, deadline).await {
+        Ok(out) => {
+            wait_settled(op, started, out.len());
+            Ok(out)
+        }
+        Err(err) if err.kind() == ErrorKind::Timeout => {
+            wait_timeout(op, started);
+            Err(err)
+        }
+        Err(err) => {
+            wait_failed(op, started, &err);
+            Err(err)
+        }
+    }
+}
+
+/// Count drained events until `agent_settled` without keeping them.
+/// `wait_for_idle` uses this so a long run holds a counter, not one
+/// `Arc` per event.
+async fn wait_idle_inner(started: Instant, deadline: Instant, rx: &mut EventStream) -> Result<()> {
+    match settle_count(rx, deadline).await {
+        Ok(count) => {
+            wait_settled("wait_for_idle", started, count);
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::Timeout => {
+            wait_timeout("wait_for_idle", started);
+            Err(err)
+        }
+        Err(err) => {
+            wait_failed("wait_for_idle", started, &err);
+            Err(err)
+        }
+    }
+}
+
+/// Lagged or closed streams are not timeouts. Reporting them as such
+/// would send readers after the wrong cause.
+fn wait_failed(op: &str, started: Instant, err: &Error) {
+    event!(
+        name: "pi_rpc.wait.failed",
+        Level::ERROR,
+        rpc.op = op,
+        error.type = ?err.kind(),
+        rpc.elapsed_ms = started.elapsed().as_millis() as u64,
+        "wait {{rpc.op}} failed ({{error.type}}) after {{rpc.elapsed_ms}}ms",
+    );
+}
+
+async fn drain_until_settled(rx: &mut EventStream, deadline: Instant) -> Result<Vec<Arc<Event>>> {
+    let mut out = Vec::new();
+    loop {
+        let event = recv_before(rx, deadline).await?;
+        let settled = matches!(&*event, Event::AgentSettled(_));
+        out.push(event);
+        if settled {
+            return Ok(out);
+        }
+    }
+}
+
+async fn settle_count(rx: &mut EventStream, deadline: Instant) -> Result<usize> {
+    let mut count = 0;
+    loop {
+        let event = recv_before(rx, deadline).await?;
+        count += 1;
+        if matches!(&*event, Event::AgentSettled(_)) {
+            return Ok(count);
+        }
+    }
+}
 /// Fold text deltas of all blocks into one string, in block order.
 ///
 /// Buffers key on message sequence plus block index, so a later assistant
@@ -1354,6 +1734,43 @@ fn unexpected(command: &str, body: &Response) -> Error {
         ErrorKind::Protocol,
         format!("wrong response for {command}: {body:?}"),
     )
+}
+
+/// Shared timeout event for both request legs. Keeps the template and
+/// fields in one place so the two call sites cannot drift apart.
+fn request_timeout(id: &str, tag: &str, started: Instant, phase: &str) {
+    event!(
+        name: "pi_rpc.request.timeout",
+        Level::WARN,
+        rpc.tag = tag,
+        rpc.id = id,
+        rpc.phase = phase,
+        rpc.elapsed_ms = started.elapsed().as_millis() as u64,
+        "{{rpc.tag}} {{rpc.id}} timed out in {{rpc.phase}} after {{rpc.elapsed_ms}}ms",
+    );
+}
+
+/// Settle event for wait helpers. Count is events seen, never content.
+fn wait_settled(op: &str, started: Instant, count: usize) {
+    event!(
+        name: "pi_rpc.wait.settled",
+        Level::DEBUG,
+        rpc.op = op,
+        rpc.events = count,
+        rpc.elapsed_ms = started.elapsed().as_millis() as u64,
+        "wait {{rpc.op}} settled with {{rpc.events}} events in {{rpc.elapsed_ms}}ms",
+    );
+}
+
+/// Timeout event for wait helpers.
+fn wait_timeout(op: &str, started: Instant) {
+    event!(
+        name: "pi_rpc.wait.timeout",
+        Level::WARN,
+        rpc.op = op,
+        rpc.elapsed_ms = started.elapsed().as_millis() as u64,
+        "wait {{rpc.op}} timed out after {{rpc.elapsed_ms}}ms",
+    );
 }
 
 /// Map a failed command to its error, keeping the pi message verbatim.

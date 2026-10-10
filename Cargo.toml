@@ -13,8 +13,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# Floor 0.1.39: event name: syntax (#2699). Never combine name: with
+# parent: without raising to 0.1.42 (#2983 fixed that variant).
+tracing = { version = "0.1.39", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [package.metadata.pi_rpc]
 pi_repo = "https://github.com/earendil-works/pi"

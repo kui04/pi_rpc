@@ -50,6 +50,27 @@ pub enum UiRequest {
     Unknown(RawRecord),
 }
 
+impl UiRequest {
+    /// Short tag for log fields. Known variants use snake_case even where
+    /// the wire method is camelCase (`setStatus` logs as `set_status`); the
+    /// catch-all carries the wire method verbatim. Mirrors the decode table
+    /// in [`decode_ui_request_value`]; keep both in one edit.
+    pub fn tag(&self) -> &str {
+        match self {
+            UiRequest::Select(_) => "select",
+            UiRequest::Confirm(_) => "confirm",
+            UiRequest::Input(_) => "input",
+            UiRequest::Editor(_) => "editor",
+            UiRequest::Notify(_) => "notify",
+            UiRequest::SetStatus(_) => "set_status",
+            UiRequest::SetWidget(_) => "set_widget",
+            UiRequest::SetTitle(_) => "set_title",
+            UiRequest::SetEditorText(_) => "set_editor_text",
+            UiRequest::Unknown(record) => record.kind.as_str(),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for UiRequest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -270,49 +291,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_nine_methods_parse_with_exact_tags() {
+    fn all_nine_methods_parse_and_tag() {
         let cases = [
             (
                 r#"{"type":"extension_ui_request","id":"1","method":"select","title":"T","options":["A"]}"#,
                 "Select",
+                "select",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"2","method":"confirm","title":"T","message":"M"}"#,
                 "Confirm",
+                "confirm",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"3","method":"input","title":"T"}"#,
                 "Input",
+                "input",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"4","method":"editor","title":"T"}"#,
                 "Editor",
+                "editor",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"5","method":"notify","message":"M"}"#,
                 "Notify",
+                "notify",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"6","method":"setStatus","statusKey":"k"}"#,
                 "SetStatus",
+                "set_status",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"7","method":"setWidget","widgetKey":"k"}"#,
                 "SetWidget",
+                "set_widget",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"8","method":"setTitle","title":"T"}"#,
                 "SetTitle",
+                "set_title",
             ),
             (
                 r#"{"type":"extension_ui_request","id":"9","method":"set_editor_text","text":"t"}"#,
                 "SetEditorText",
+                "set_editor_text",
             ),
         ];
-        for (wire, name) in cases {
+        for (wire, name, tag) in cases {
             let (id, req) = decode_ui_request(wire).unwrap();
             assert!(!id.is_empty());
             assert_eq!(format!("{req:?}").split('(').next(), Some(name));
+            assert_eq!(req.tag(), tag);
         }
     }
 
@@ -323,6 +354,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(req, UiRequest::Unknown(_)));
+        assert_eq!(req.tag(), "future_dialog");
     }
 }
 

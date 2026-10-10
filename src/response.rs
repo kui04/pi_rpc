@@ -70,6 +70,51 @@ pub enum Response {
     Unknown(UnknownResponse),
 }
 
+impl Response {
+    /// Short tag for log fields. Known variants use snake_case; the
+    /// catch-all and failed commands carry the wire command verbatim.
+    /// Mirrors the decode table in [`decode_envelope_value`]; keep both in one edit.
+    pub fn tag(&self) -> &str {
+        match self {
+            Response::Prompt(_) => "prompt",
+            Response::Steer(_) => "steer",
+            Response::FollowUp(_) => "follow_up",
+            Response::Abort => "abort",
+            Response::ClearQueue(_) => "clear_queue",
+            Response::NewSession(_) => "new_session",
+            Response::GetState(_) => "get_state",
+            Response::SetModel(_) => "set_model",
+            Response::CycleModel(_) => "cycle_model",
+            Response::GetAvailableModels(_) => "get_available_models",
+            Response::SetThinkingLevel => "set_thinking_level",
+            Response::CycleThinkingLevel(_) => "cycle_thinking_level",
+            Response::GetAvailableThinkingLevels(_) => "get_available_thinking_levels",
+            Response::SetSteeringMode => "set_steering_mode",
+            Response::SetFollowUpMode => "set_follow_up_mode",
+            Response::Compact(_) => "compact",
+            Response::SetAutoCompaction => "set_auto_compaction",
+            Response::SetAutoRetry => "set_auto_retry",
+            Response::AbortRetry => "abort_retry",
+            Response::Bash(_) => "bash",
+            Response::AbortBash => "abort_bash",
+            Response::GetSessionStats(_) => "get_session_stats",
+            Response::ExportHtml(_) => "export_html",
+            Response::SwitchSession(_) => "switch_session",
+            Response::Fork(_) => "fork",
+            Response::Clone(_) => "clone",
+            Response::GetForkMessages(_) => "get_fork_messages",
+            Response::GetEntries(_) => "get_entries",
+            Response::GetTree(_) => "get_tree",
+            Response::GetLastAssistantText(_) => "get_last_assistant_text",
+            Response::SetSessionName => "set_session_name",
+            Response::GetMessages(_) => "get_messages",
+            Response::GetCommands(_) => "get_commands",
+            Response::Error(failed) => failed.command.as_str(),
+            Response::Unknown(unknown) => unknown.command.as_str(),
+        }
+    }
+}
+
 /// Raw record for commands this lib does not know yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnknownResponse {

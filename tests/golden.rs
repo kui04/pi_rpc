@@ -421,3 +421,72 @@ fn doc_get_state_response() {
         other => panic!("wrong variant: {other:?}"),
     }
 }
+
+/// Log tags match the wire tags they decode from. The `tag()` tables
+/// mirror the decode tables; this pins the mapping for a sample across
+/// all three tag types. Full enumeration is impractical (most payloads
+/// need shaped data), and adding a variant already breaks `tag()`
+/// compilation through its exhaustive match.
+#[test]
+fn log_tags_match_wire_tags() {
+    for (wire, want) in [
+        (r#"{"type":"agent_start"}"#, "agent_start"),
+        (r#"{"type":"turn_start"}"#, "turn_start"),
+        (
+            r#"{"type":"summarization_retry_finished"}"#,
+            "summarization_retry_finished",
+        ),
+        (
+            r#"{"type":"agent_settled","aborted":false}"#,
+            "agent_settled",
+        ),
+        (
+            r#"{"type":"bash_execution_update","id":"req-1","delta":"total 48\n"}"#,
+            "bash_execution_update",
+        ),
+        (
+            r#"{"type":"extension_error","extensionPath":"/x.ts","event":"tool_call","error":"boom"}"#,
+            "extension_error",
+        ),
+        (r#"{"type":"future_event","id":"e1"}"#, "future_event"),
+    ] {
+        let event = decode_event(wire).expect("vector must parse");
+        assert_eq!(event.tag(), want, "event tag for {wire}");
+    }
+    for (command, want) in [
+        ("abort", "abort"),
+        ("set_thinking_level", "set_thinking_level"),
+        ("set_steering_mode", "set_steering_mode"),
+        ("set_follow_up_mode", "set_follow_up_mode"),
+        ("set_auto_compaction", "set_auto_compaction"),
+        ("set_auto_retry", "set_auto_retry"),
+        ("abort_retry", "abort_retry"),
+        ("abort_bash", "abort_bash"),
+        ("set_session_name", "set_session_name"),
+    ] {
+        let wire = format!(r#"{{"type":"response","command":"{command}","success":true}}"#);
+        let env = decode_envelope(&wire).expect("vector must parse");
+        assert_eq!(env.body.tag(), want, "response tag for {command}");
+    }
+    for (wire, want) in [
+        (
+            r#"{"id":"req-2","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}"#,
+            "prompt",
+        ),
+        (
+            r#"{"id":"req-1","type":"response","command":"bash","success":true,"data":{"output":"total 48\n","exitCode":0,"cancelled":false,"truncated":false}}"#,
+            "bash",
+        ),
+        (
+            r#"{"id":"req-3","type":"response","command":"future_cmd","success":true}"#,
+            "future_cmd",
+        ),
+        (
+            r#"{"id":"req-4","type":"response","command":"prompt","success":false,"error":"no model"}"#,
+            "prompt",
+        ),
+    ] {
+        let env = decode_envelope(wire).expect("vector must parse");
+        assert_eq!(env.body.tag(), want, "response tag for {wire}");
+    }
+}

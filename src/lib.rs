@@ -47,6 +47,36 @@
 //! frame with [`Decoder`](frame::Decoder). The client wraps every wait in a deadline and
 //! fails pending work as `Closed` when the path ends.
 //!
+//! # Logs
+//!
+//! The client emits structured `tracing` events, named `pi_rpc.<area>.<outcome>`
+//! (`pi_rpc.request.sent`, `pi_rpc.dispatch.orphan`, `pi_rpc.reader.over_cap`).
+//! Fields carry shape only: command tag, request id, byte length, record kind,
+//! counts, elapsed millis. No prompt text, message body, or dialog content
+//! ever enters a field, so logs stay safe to keep.
+//!
+//! Message templates spell `{{field}}`; the rendered text keeps `{field}`
+//! literally under the default `fmt()` subscriber. Values ride in the
+//! attached fields, not in the text. Two caps report separately:
+//! `pi_rpc.frame.over_cap` fires in [`Decoder`](frame::Decoder) for
+//! byte-stream backends, while
+//! `pi_rpc.reader.over_cap` fires in the client when a whole line from a
+//! record transport exceeds the cap.
+//!
+//! Levels: `TRACE` is wire line flow; `DEBUG` is request lifecycle, wait
+//! settle, dispatch match, fan-out, dialogs, and close; `WARN` is timeouts,
+//! over-cap lines, lagged streams, cleanly ended streams, failed closes,
+//! panicking listeners, auto-dismissed dialogs, and dropped answers; `ERROR`
+//! is dead transports, sends on a closed client, and failed waits. Without
+//! a subscriber every macro is a no-op; this library never installs one. A
+//! binary enables output like this:
+//!
+//! ```no_run
+//! tracing_subscriber::fmt()
+//!     .with_env_filter("pi_rpc=debug")
+//!     .init();
+//! ```
+//!
 //! # Numbers
 //!
 //! Wire integers decode to `f64` and print back as floats (`200000` may

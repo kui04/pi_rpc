@@ -59,6 +59,42 @@ pub enum Event {
     Unknown(RawRecord),
 }
 
+impl Event {
+    /// Short tag for log fields. Known variants use snake_case; the
+    /// catch-all carries the wire string verbatim, so a new pi event
+    /// stays visible instead of collapsing to one bucket. Mirrors the
+    /// decode table in [`decode_event_value`]; keep both in one edit.
+    pub fn tag(&self) -> &str {
+        match self {
+            Event::AgentStart => "agent_start",
+            Event::AgentEnd(_) => "agent_end",
+            Event::AgentSettled(_) => "agent_settled",
+            Event::TurnStart => "turn_start",
+            Event::TurnEnd(_) => "turn_end",
+            Event::MessageStart(_) => "message_start",
+            Event::MessageUpdate(_) => "message_update",
+            Event::MessageEnd(_) => "message_end",
+            Event::ToolExecutionStart(_) => "tool_execution_start",
+            Event::ToolExecutionUpdate(_) => "tool_execution_update",
+            Event::ToolExecutionEnd(_) => "tool_execution_end",
+            Event::QueueUpdate(_) => "queue_update",
+            Event::EntryAppended(_) => "entry_appended",
+            Event::SessionInfoChanged(_) => "session_info_changed",
+            Event::ThinkingLevelChanged(_) => "thinking_level_changed",
+            Event::CompactionStart(_) => "compaction_start",
+            Event::CompactionEnd(_) => "compaction_end",
+            Event::AutoRetryStart(_) => "auto_retry_start",
+            Event::AutoRetryEnd(_) => "auto_retry_end",
+            Event::SummarizationRetryScheduled(_) => "summarization_retry_scheduled",
+            Event::SummarizationRetryAttemptStart(_) => "summarization_retry_attempt_start",
+            Event::SummarizationRetryFinished => "summarization_retry_finished",
+            Event::BashExecutionUpdate(_) => "bash_execution_update",
+            Event::ExtensionError(_) => "extension_error",
+            Event::Unknown(record) => record.kind.as_str(),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
