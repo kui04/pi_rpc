@@ -364,10 +364,10 @@ mod tests {
 /// Timeouts resolve pi-side, so answer fast and skip local timers.
 #[async_trait::async_trait]
 pub trait UiHandler: Send {
-    async fn select(&mut self, dialog: SelectDialog) -> UiOutcome;
-    async fn confirm(&mut self, dialog: ConfirmDialog) -> bool;
-    async fn input(&mut self, dialog: InputDialog) -> UiOutcome;
-    async fn editor(&mut self, dialog: EditorDialog) -> UiOutcome;
+    async fn select(&mut self, id: String, dialog: SelectDialog) -> UiOutcome;
+    async fn confirm(&mut self, id: String, dialog: ConfirmDialog) -> bool;
+    async fn input(&mut self, id: String, dialog: InputDialog) -> UiOutcome;
+    async fn editor(&mut self, id: String, dialog: EditorDialog) -> UiOutcome;
     async fn notify(&mut self, _notice: Notice) {}
     async fn set_status(&mut self, _entry: StatusEntry) {}
     async fn set_widget(&mut self, _entry: WidgetEntry) {}

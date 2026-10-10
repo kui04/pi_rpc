@@ -1521,7 +1521,7 @@ async fn dispatch_ui_value(inner: &Arc<Inner>, value: serde_json::Value) {
             // Expiry auto-dismisses.
             let answer = match tokio::time::timeout(
                 worker.config.wait_timeout,
-                answer_dialog(&worker, &request),
+                answer_dialog(&worker, &id, &request),
             )
             .await
             {
@@ -1582,24 +1582,24 @@ async fn dispatch_ui_value(inner: &Arc<Inner>, value: serde_json::Value) {
     );
 }
 
-async fn answer_dialog(inner: &Arc<Inner>, request: &UiRequest) -> Option<UiAnswer> {
+async fn answer_dialog(inner: &Arc<Inner>, id: &str, request: &UiRequest) -> Option<UiAnswer> {
     let mut ui = inner.ui.lock().await;
     let Some(handler) = ui.as_mut() else {
         return Some(UiAnswer::Cancelled);
     };
     match request {
-        UiRequest::Select(dialog) => match handler.select(dialog.clone()).await {
+        UiRequest::Select(dialog) => match handler.select(id.to_string(), dialog.clone()).await {
             UiOutcome::Value(value) => Some(UiAnswer::Value(value)),
             UiOutcome::Dismissed => Some(UiAnswer::Cancelled),
         },
-        UiRequest::Confirm(dialog) => {
-            Some(UiAnswer::Confirmed(handler.confirm(dialog.clone()).await))
-        }
-        UiRequest::Input(dialog) => match handler.input(dialog.clone()).await {
+        UiRequest::Confirm(dialog) => Some(UiAnswer::Confirmed(
+            handler.confirm(id.to_string(), dialog.clone()).await,
+        )),
+        UiRequest::Input(dialog) => match handler.input(id.to_string(), dialog.clone()).await {
             UiOutcome::Value(value) => Some(UiAnswer::Value(value)),
             UiOutcome::Dismissed => Some(UiAnswer::Cancelled),
         },
-        UiRequest::Editor(dialog) => match handler.editor(dialog.clone()).await {
+        UiRequest::Editor(dialog) => match handler.editor(id.to_string(), dialog.clone()).await {
             UiOutcome::Value(value) => Some(UiAnswer::Value(value)),
             UiOutcome::Dismissed => Some(UiAnswer::Cancelled),
         },

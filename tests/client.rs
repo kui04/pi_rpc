@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use pi_rpc::client::Client;
@@ -249,20 +250,21 @@ async fn prompt_text_folds_deltas() {
     client.close().await.unwrap();
 }
 
-struct AllowAll;
+struct AllowAll(Arc<std::sync::Mutex<Option<String>>>);
 
 #[async_trait::async_trait]
 impl pi_rpc::extui::UiHandler for AllowAll {
-    async fn select(&mut self, _d: SelectDialog) -> UiOutcome {
+    async fn select(&mut self, id: String, _d: SelectDialog) -> UiOutcome {
+        *self.0.lock().unwrap() = Some(id);
         UiOutcome::Value("Allow".to_string())
     }
-    async fn confirm(&mut self, _d: ConfirmDialog) -> bool {
+    async fn confirm(&mut self, _id: String, _d: ConfirmDialog) -> bool {
         true
     }
-    async fn input(&mut self, _d: InputDialog) -> UiOutcome {
+    async fn input(&mut self, _id: String, _d: InputDialog) -> UiOutcome {
         UiOutcome::Dismissed
     }
-    async fn editor(&mut self, _d: EditorDialog) -> UiOutcome {
+    async fn editor(&mut self, _id: String, _d: EditorDialog) -> UiOutcome {
         UiOutcome::Dismissed
     }
 }
@@ -270,8 +272,9 @@ impl pi_rpc::extui::UiHandler for AllowAll {
 #[tokio::test]
 async fn dialog_roundtrip_answers_select() {
     let (transport, mut peer) = pair();
+    let seen = Arc::new(std::sync::Mutex::new(None));
     let client = std::sync::Arc::new(Client::with_config(transport, fast_config()));
-    client.set_ui_handler(AllowAll).await;
+    client.set_ui_handler(AllowAll(seen.clone())).await;
     let task = tokio::spawn({
         let c = client.clone();
         async move { c.get_state().await }
@@ -291,6 +294,7 @@ async fn dialog_roundtrip_answers_select() {
     assert_eq!(v["type"], "extension_ui_response");
     assert_eq!(v["id"], "u1");
     assert_eq!(v["value"], "Allow");
+    assert_eq!(seen.lock().unwrap().as_deref(), Some("u1"));
     peer.out.send(state_response(&id)).unwrap();
     task.await.unwrap().unwrap();
     drop(peer.out);
