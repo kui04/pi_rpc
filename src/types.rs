@@ -1,6 +1,6 @@
 //! Shared types used by commands, responses, messages, and events.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/agent/src/types.ts:349` (`ThinkingLevel`);
 //! `packages/ai/src/types.ts:446-467` (`Usage`);
 //! `packages/ai/src/types.ts:820-867` (`BaseModel`, `Model`);

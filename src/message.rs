@@ -1,6 +1,6 @@
 //! Conversation messages carried by responses and session entries.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/docs/message-types.md:13-65` (blocks),
 //! `:67-90` (`Usage`), `:92-195` (base messages),
 //! `:196-261` (coding-agent roles), `:263-280` (union).

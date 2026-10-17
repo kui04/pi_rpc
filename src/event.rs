@@ -1,9 +1,9 @@
 //! Stdout session events with delta-only streaming updates.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/agent/src/types.ts:516-539` (`AgentEvent`);
 //! `packages/coding-agent/src/core/agent-session.ts:188-193`
-//! (parent tool id), `:196-238` (session events);
+//! (parent tool id), `:196-245` (session events);
 //! `packages/coding-agent/src/modes/json-event.ts:18` (wire shape),
 //! `:48-62` (`toJsonEvent` delta strip);
 //! `packages/ai/src/types.ts:801-817` (assistant update variants).

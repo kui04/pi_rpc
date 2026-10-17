@@ -1,6 +1,6 @@
 //! Extension UI dialog subprotocol.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/modes/rpc/rpc-types.ts:252-297`
 //! (request and response unions).
 //! Behaviors: `packages/coding-agent/docs/rpc-extension-ui.md:12-26`

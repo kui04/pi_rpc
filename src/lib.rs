@@ -6,7 +6,7 @@
 //! Users supply a transport over any byte path such as stdio pipes, an HTTP
 //! stream, or an SSH channel.
 //!
-//! Pinned upstream: pi `f1b2e77f5b13b2a199b1052cb79c235451afe7d7`
+//! Pinned upstream: pi `v1.3.0`
 //! (see `Cargo.toml [package.metadata.pi_rpc]`). Each module cites the exact
 //! source file and lines it mirrors, so reviewers can check every shape.
 //!
@@ -14,7 +14,7 @@
 //!
 //! Reads ignore unknown fields, and unknown record types map to catch-all
 //! variants, so newer pi versions keep parsing. Writes use the exact pinned
-//! shape. A pi update means a new pinned hash, a new review, and a new
+//! shape. A pi update means a new pinned release tag, a new review, and a new
 //! golden run, never silent drift.
 //!
 //! Three normalizations apply on write: missing and explicit-null optionals
@@ -173,7 +173,6 @@ pub mod event;
 pub mod extui;
 pub mod frame;
 pub mod message;
-pub mod proto_v8;
 pub mod response;
 pub mod transport;
 pub mod types;

@@ -1,6 +1,6 @@
 //! Append-only session entries forming the branch tree.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/core/session-manager.ts:43-50` (header),
 //! `:57-62` (base), `:64-180` (11 entry kinds), `:183-194` (union),
 //! `:200-207` (tree node).

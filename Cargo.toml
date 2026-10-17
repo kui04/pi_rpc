@@ -22,5 +22,4 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [package.metadata.pi_rpc]
 pi_repo = "https://github.com/earendil-works/pi"
-pi_rev = "f1b2e77f5b13b2a199b1052cb79c235451afe7d7"
-pi_protocol_version = 8
+pi_tag = "v1.3.0"

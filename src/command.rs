@@ -1,6 +1,6 @@
 //! Stdin commands. One JSON object per line.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/modes/rpc/rpc-types.ts:20-94` (`RpcCommand`).
 //! Shapes: `packages/coding-agent/docs/rpc-commands.md`.
 

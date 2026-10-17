@@ -1,6 +1,6 @@
 //! LF-only JSONL framing.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/modes/rpc/jsonl.ts:10-21`
 //! (`serializeJsonLine`, `attachJsonlLineReader`).
 //! Rules: `packages/coding-agent/docs/rpc.md:50-56` (Framing).

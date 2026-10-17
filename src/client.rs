@@ -1,6 +1,6 @@
 //! Multiplexing client over any [`Transport`].
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/modes/rpc/rpc-client.ts:50` (listener type),
 //! `:118-225` (start, stop, stdin errors, exit handling),
 //! `:471-527` (`waitForIdle`, `collectEvents`, `promptAndWait`),

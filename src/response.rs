@@ -1,6 +1,6 @@
 //! Stdout command responses with typed data.
 //!
-//! Source: pi `f1b2e77`
+//! Source: pi `v1.3.0`
 //! `packages/coding-agent/src/modes/rpc/rpc-types.ts:96-115`
 //! (`RpcSessionState`), `:116-245` (`RpcResponse`).
 //! `SessionStats` detail:
